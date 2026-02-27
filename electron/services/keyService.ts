@@ -744,7 +744,8 @@ export class KeyService {
     return (
       existsSync(join(dirPath, 'db_storage')) ||
       existsSync(join(dirPath, 'FileStorage', 'Image')) ||
-      existsSync(join(dirPath, 'FileStorage', 'Image2'))
+      existsSync(join(dirPath, 'FileStorage', 'Image2')) ||
+      existsSync(join(dirPath, 'msg', 'attach'))
     )
   }
 
@@ -761,8 +762,8 @@ export class KeyService {
   private listAccountDirs(rootDir: string): string[] {
     try {
       const entries = readdirSync(rootDir)
-      const high: string[] = []
-      const low: string[] = []
+      const candidates: { path: string; mtime: number; isAccount: boolean }[] = []
+      
       for (const entry of entries) {
         const fullPath = join(rootDir, entry)
         try {
@@ -775,15 +776,45 @@ export class KeyService {
           continue
         }
 
-        if (this.isAccountDir(fullPath)) {
-          high.push(fullPath)
-        } else {
-          low.push(fullPath)
-        }
+        const isAccount = this.isAccountDir(fullPath)
+        candidates.push({ 
+          path: fullPath, 
+          mtime: this.getDirMtime(fullPath),
+          isAccount 
+        })
       }
-      return high.length ? high.sort() : low.sort()
+      
+      // 优先选择有效账号目录，然后按修改时间从新到旧排序
+      return candidates
+        .sort((a, b) => {
+          if (a.isAccount !== b.isAccount) return a.isAccount ? -1 : 1
+          return b.mtime - a.mtime
+        })
+        .map(c => c.path)
     } catch {
       return []
+    }
+  }
+
+  private getDirMtime(dirPath: string): number {
+    try {
+      const stat = statSync(dirPath)
+      let mtime = stat.mtimeMs
+      
+      // 检查几个关键子目录的修改时间，以更准确地反映活动状态
+      const subDirs = ['db_storage', 'msg/attach', 'FileStorage/Image']
+      for (const sub of subDirs) {
+        const fullPath = join(dirPath, sub)
+        if (existsSync(fullPath)) {
+          try {
+            mtime = Math.max(mtime, statSync(fullPath).mtimeMs)
+          } catch { }
+        }
+      }
+      
+      return mtime
+    } catch {
+      return 0
     }
   }
 

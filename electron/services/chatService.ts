@@ -4478,27 +4478,77 @@ class ChatService {
   }
 
   private resolveAccountDir(dbPath: string, wxid: string): string | null {
-    const normalized = dbPath.replace(/[\\\\/]+$/, '')
+    const cleanedWxid = this.cleanAccountDirName(wxid).toLowerCase()
+    const normalized = dbPath.replace(/[\\/]+$/, '')
 
-    // 如果 dbPath 本身指向 db_storage 目录下的文件（如某个 .db 文件）
-    // 则向上回溯到账号目录
-    if (basename(normalized).toLowerCase() === 'db_storage') {
-      return dirname(normalized)
-    }
-    const dir = dirname(normalized)
-    if (basename(dir).toLowerCase() === 'db_storage') {
-      return dirname(dir)
-    }
+    const candidates: { path: string; mtime: number }[] = []
 
-    // 否则，dbPath 应该是数据库根目录（如 xwechat_files）
-    // 账号目录应该是 {dbPath}/{wxid}
-    const accountDirWithWxid = join(normalized, wxid)
-    if (existsSync(accountDirWithWxid)) {
-      return accountDirWithWxid
+    // 检查直接路径
+    const direct = join(normalized, cleanedWxid)
+    if (existsSync(direct) && this.isAccountDir(direct)) {
+      candidates.push({ path: direct, mtime: this.getDirMtime(direct) })
     }
 
-    // 兜底：返回 dbPath 本身（可能 dbPath 已经是账号目录）
-    return normalized
+    // 检查 dbPath 本身是否就是账号目录
+    if (this.isAccountDir(normalized)) {
+      candidates.push({ path: normalized, mtime: this.getDirMtime(normalized) })
+    }
+
+    // 扫描 dbPath 下的所有子目录寻找匹配的 wxid
+    try {
+      if (existsSync(normalized) && statSync(normalized).isDirectory()) {
+        const entries = readdirSync(normalized)
+        for (const entry of entries) {
+          const entryPath = join(normalized, entry)
+          try {
+            if (!statSync(entryPath).isDirectory()) continue
+          } catch { continue }
+          
+          const lowerEntry = entry.toLowerCase()
+          if (lowerEntry === cleanedWxid || lowerEntry.startsWith(`${cleanedWxid}_`)) {
+            if (this.isAccountDir(entryPath)) {
+              if (!candidates.some(c => c.path === entryPath)) {
+                candidates.push({ path: entryPath, mtime: this.getDirMtime(entryPath) })
+              }
+            }
+          }
+        }
+      }
+    } catch { }
+
+    if (candidates.length === 0) return null
+
+    // 按修改时间降序排序，取最新的
+    candidates.sort((a, b) => b.mtime - a.mtime)
+    return candidates[0].path
+  }
+
+  private isAccountDir(dirPath: string): boolean {
+    return (
+      existsSync(join(dirPath, 'db_storage')) ||
+      existsSync(join(dirPath, 'FileStorage', 'Image')) ||
+      existsSync(join(dirPath, 'FileStorage', 'Image2')) ||
+      existsSync(join(dirPath, 'msg', 'attach'))
+    )
+  }
+
+  private getDirMtime(dirPath: string): number {
+    try {
+      const stat = statSync(dirPath)
+      let mtime = stat.mtimeMs
+      const subDirs = ['db_storage', 'msg/attach', 'FileStorage/Image']
+      for (const sub of subDirs) {
+        const fullPath = join(dirPath, sub)
+        if (existsSync(fullPath)) {
+          try {
+            mtime = Math.max(mtime, statSync(fullPath).mtimeMs)
+          } catch { }
+        }
+      }
+      return mtime
+    } catch {
+      return 0
+    }
   }
 
   private async findDatFile(accountDir: string, baseName: string, sessionId?: string): Promise<string | null> {

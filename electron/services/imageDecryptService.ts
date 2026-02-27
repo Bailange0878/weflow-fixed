@@ -329,28 +329,78 @@ export class ImageDecryptService {
   }
 
   private resolveAccountDir(dbPath: string, wxid: string): string | null {
-    const cleanedWxid = this.cleanAccountDirName(wxid)
+    const cleanedWxid = this.cleanAccountDirName(wxid).toLowerCase()
     const normalized = dbPath.replace(/[\\/]+$/, '')
 
+    const candidates: { path: string; mtime: number }[] = []
+
+    // 检查直接路径
     const direct = join(normalized, cleanedWxid)
-    if (existsSync(direct)) return direct
+    if (existsSync(direct) && this.isAccountDir(direct)) {
+      candidates.push({ path: direct, mtime: this.getDirMtime(direct) })
+    }
 
-    if (this.isAccountDir(normalized)) return normalized
+    // 检查 dbPath 本身是否就是账号目录
+    if (this.isAccountDir(normalized)) {
+      candidates.push({ path: normalized, mtime: this.getDirMtime(normalized) })
+    }
 
+    // 扫描 dbPath 下的所有子目录寻找匹配的 wxid
     try {
-      const entries = readdirSync(normalized)
-      const lowerWxid = cleanedWxid.toLowerCase()
-      for (const entry of entries) {
-        const entryPath = join(normalized, entry)
-        if (!this.isDirectory(entryPath)) continue
-        const lowerEntry = entry.toLowerCase()
-        if (lowerEntry === lowerWxid || lowerEntry.startsWith(`${lowerWxid}_`)) {
-          if (this.isAccountDir(entryPath)) return entryPath
+      if (existsSync(normalized) && this.isDirectory(normalized)) {
+        const entries = readdirSync(normalized)
+        for (const entry of entries) {
+          const entryPath = join(normalized, entry)
+          if (!this.isDirectory(entryPath)) continue
+          
+          const lowerEntry = entry.toLowerCase()
+          // 匹配原 wxid 或带有后缀的 wxid (如 wxid_xxx_1234)
+          if (lowerEntry === cleanedWxid || lowerEntry.startsWith(`${cleanedWxid}_`)) {
+            if (this.isAccountDir(entryPath)) {
+              if (!candidates.some(c => c.path === entryPath)) {
+                candidates.push({ path: entryPath, mtime: this.getDirMtime(entryPath) })
+              }
+            }
+          }
         }
       }
     } catch { }
 
-    return null
+    if (candidates.length === 0) return null
+
+    // 按修改时间降序排序，取最新的（最可能是当前活跃的）
+    candidates.sort((a, b) => b.mtime - a.mtime)
+    
+    if (candidates.length > 1) {
+      this.logInfo('找到多个候选账号目录，选择最新修改的一个', { 
+        selected: candidates[0].path,
+        all: candidates.map(c => c.path) 
+      })
+    }
+
+    return candidates[0].path
+  }
+
+  private getDirMtime(dirPath: string): number {
+    try {
+      const stat = statSync(dirPath)
+      let mtime = stat.mtimeMs
+      
+      // 检查几个关键子目录的修改时间，以更准确地反映活动状态
+      const subDirs = ['db_storage', 'msg/attach', 'FileStorage/Image']
+      for (const sub of subDirs) {
+        const fullPath = join(dirPath, sub)
+        if (existsSync(fullPath)) {
+          try {
+            mtime = Math.max(mtime, statSync(fullPath).mtimeMs)
+          } catch { }
+        }
+      }
+      
+      return mtime
+    } catch {
+      return 0
+    }
   }
 
   /**

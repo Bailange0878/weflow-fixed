@@ -3543,7 +3543,7 @@ function MessageBubble({
     videoLoadingRef.current = true
     setVideoLoading(true)
     try {
-      const result = await window.electronAPI.video.getVideoInfo(videoMd5)
+      const result = await window.electronAPI.video.getVideoInfo(videoMd5, session.username)
       if (result && result.success && result.exists) {
         setVideoInfo({
           exists: result.exists,
@@ -3560,7 +3560,7 @@ function MessageBubble({
       videoLoadingRef.current = false
       setVideoLoading(false)
     }
-  }, [videoMd5])
+  }, [videoMd5, session.username])
 
   // 视频进入视野时自动加载
   useEffect(() => {

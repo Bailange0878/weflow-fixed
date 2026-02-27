@@ -1,11 +1,13 @@
-﻿import { join } from 'path'
-import { existsSync, readdirSync, statSync, readFileSync } from 'fs'
+import { join, basename, extname, dirname } from 'path'
+import { existsSync, readdirSync, statSync, readFileSync, appendFileSync, mkdirSync, writeFileSync } from 'fs'
+import { app } from 'electron'
 import { ConfigService } from './config'
 import Database from 'better-sqlite3'
 import { wcdbService } from './wcdbService'
+import crypto from 'crypto'
 
 export interface VideoInfo {
-    videoUrl?: string       // 视频文件路径（用于 readFile）
+    videoUrl?: string       // 视频文件路径
     coverUrl?: string       // 封面 data URL
     thumbUrl?: string       // 缩略图 data URL
     exists: boolean
@@ -13,266 +15,379 @@ export interface VideoInfo {
 
 class VideoService {
     private configService: ConfigService
+    private resolvedCache = new Map<string, string>() // md5 -> localPath
 
     constructor() {
         this.configService = new ConfigService()
     }
 
-    /**
-     * 获取数据库根目录
-     */
+    private logInfo(message: string, meta?: Record<string, unknown>): void {
+        if (!this.configService.get('logEnabled')) return
+        const timestamp = new Date().toISOString()
+        const metaStr = meta ? ` ${JSON.stringify(meta)}` : ''
+        const logLine = `[${timestamp}] [VideoService] ${message}${metaStr}\n`
+        this.writeLog(logLine)
+    }
+
+    private logError(message: string, error?: unknown, meta?: Record<string, unknown>): void {
+        if (!this.configService.get('logEnabled')) return
+        const timestamp = new Date().toISOString()
+        const errorStr = error ? ` Error: ${String(error)}` : ''
+        const metaStr = meta ? ` ${JSON.stringify(meta)}` : ''
+        const logLine = `[${timestamp}] [VideoService] ERROR: ${message}${errorStr}${metaStr}\n`
+        console.error(`[VideoService] ${message}`, error, meta)
+        this.writeLog(logLine)
+    }
+
+    private writeLog(line: string): void {
+        try {
+            const logDir = join(app.getPath('userData'), 'logs')
+            if (!existsSync(logDir)) {
+                mkdirSync(logDir, { recursive: true })
+            }
+            appendFileSync(join(logDir, 'wcdb.log'), line, { encoding: 'utf8' })
+        } catch (err) {
+            console.error('写入日志失败:', err)
+        }
+    }
+
     private getDbPath(): string {
         return this.configService.get('dbPath') || ''
     }
 
-    /**
-     * 获取当前用户的wxid
-     */
     private getMyWxid(): string {
         return this.configService.get('myWxid') || ''
     }
 
-    /**
-     * 获取缓存目录（解密后的数据库存放位置）
-     */
-    private getCachePath(): string {
+    private getCacheBasePath(): string {
         return this.configService.getCacheBasePath()
     }
 
-    /**
-     * 清理 wxid 目录名（去掉后缀）
-     */
     private cleanWxid(wxid: string): string {
         const trimmed = wxid.trim()
         if (!trimmed) return trimmed
-
         if (trimmed.toLowerCase().startsWith('wxid_')) {
             const match = trimmed.match(/^(wxid_[^_]+)/i)
             if (match) return match[1]
-            return trimmed
         }
-
         const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/)
         if (suffixMatch) return suffixMatch[1]
-
         return trimmed
     }
 
-    /**
-     * 从 video_hardlink_info_v4 表查询视频文件名
-     * 优先使用 cachePath 中解密后的 hardlink.db（使用 better-sqlite3）
-     * 如果失败，则尝试使用 wcdbService.execQuery 查询加密的 hardlink.db
-     */
-    private async queryVideoFileName(md5: string): Promise<string | undefined> {
-        const cachePath = this.getCachePath()
-        const dbPath = this.getDbPath()
-        const wxid = this.getMyWxid()
-        const cleanedWxid = this.cleanWxid(wxid)
+    private resolveAccountDir(dbPath: string, wxid: string): string | null {
+        if (!dbPath || !wxid) return null
+        const cleanedWxid = this.cleanWxid(wxid).toLowerCase()
+        const normalized = dbPath.replace(/[\\/]+$/, '')
+        const candidates: { path: string; mtime: number }[] = []
 
-        if (!wxid) return undefined
-
-        // 方法1：优先在 cachePath 下查找解密后的 hardlink.db
-        if (cachePath) {
-            const cacheDbPaths = [
-                join(cachePath, cleanedWxid, 'hardlink.db'),
-                join(cachePath, wxid, 'hardlink.db'),
-                join(cachePath, 'hardlink.db'),
-                join(cachePath, 'databases', cleanedWxid, 'hardlink.db'),
-                join(cachePath, 'databases', wxid, 'hardlink.db')
-            ]
-
-            for (const p of cacheDbPaths) {
-                if (existsSync(p)) {
-                    try {
-                        const db = new Database(p, { readonly: true })
-                        const row = db.prepare(`
-                            SELECT file_name, md5 FROM video_hardlink_info_v4 
-                            WHERE md5 = ? 
-                            LIMIT 1
-                        `).get(md5) as { file_name: string; md5: string } | undefined
-                        db.close()
-
-                        if (row?.file_name) {
-                            const realMd5 = row.file_name.replace(/\.[^.]+$/, '')
-                            return realMd5
-                        }
-                    } catch (e) {
-                        // 忽略错误
-                    }
-                }
+        const checkDir = (p: string) => {
+            if (existsSync(p) && (existsSync(join(p, 'db_storage')) || existsSync(join(p, 'msg', 'video')) || existsSync(join(p, 'msg', 'attach')))) {
+                candidates.push({ path: p, mtime: this.getDirMtime(p) })
             }
         }
 
-        // 方法2：使用 wcdbService.execQuery 查询加密的 hardlink.db
-        if (dbPath) {
-            // 检查 dbPath 是否已经包含 wxid
-            const dbPathLower = dbPath.toLowerCase()
-            const wxidLower = wxid.toLowerCase()
-            const cleanedWxidLower = cleanedWxid.toLowerCase()
-            const dbPathContainsWxid = dbPathLower.includes(wxidLower) || dbPathLower.includes(cleanedWxidLower)
+        checkDir(join(normalized, wxid))
+        checkDir(join(normalized, cleanedWxid))
+        checkDir(normalized)
 
-            const encryptedDbPaths: string[] = []
-            if (dbPathContainsWxid) {
-                // dbPath 已包含 wxid，不需要再拼接
-                encryptedDbPaths.push(join(dbPath, 'db_storage', 'hardlink', 'hardlink.db'))
-            } else {
-                // dbPath 不包含 wxid，需要拼接
-                encryptedDbPaths.push(join(dbPath, wxid, 'db_storage', 'hardlink', 'hardlink.db'))
-                encryptedDbPaths.push(join(dbPath, cleanedWxid, 'db_storage', 'hardlink', 'hardlink.db'))
-            }
-
-            for (const p of encryptedDbPaths) {
-                if (existsSync(p)) {
+        try {
+            if (existsSync(normalized) && statSync(normalized).isDirectory()) {
+                const entries = readdirSync(normalized)
+                for (const entry of entries) {
+                    const entryPath = join(normalized, entry)
                     try {
-                        const escapedMd5 = md5.replace(/'/g, "''")
-
-                        // 用 md5 字段查询，获取 file_name
-                        const sql = `SELECT file_name FROM video_hardlink_info_v4 WHERE md5 = '${escapedMd5}' LIMIT 1`
-
-                        const result = await wcdbService.execQuery('media', p, sql)
-
-                        if (result.success && result.rows && result.rows.length > 0) {
-                            const row = result.rows[0]
-                            if (row?.file_name) {
-                                // 提取不带扩展名的文件名作为实际视频 MD5
-                                const realMd5 = String(row.file_name).replace(/\.[^.]+$/, '')
-                                return realMd5
-                            }
-                        }
-                    } catch (e) {
-                        // 忽略错误
+                        if (!statSync(entryPath).isDirectory()) continue
+                    } catch { continue }
+                    const lowerEntry = entry.toLowerCase()
+                    if (lowerEntry === cleanedWxid || lowerEntry.startsWith(`${cleanedWxid}_`)) {
+                        checkDir(entryPath)
                     }
                 }
             }
+        } catch { }
+
+        if (candidates.length === 0) return null
+        candidates.sort((a, b) => b.mtime - a.mtime)
+        return candidates[0].path
+    }
+
+    private getDirMtime(dirPath: string): number {
+        try {
+            let mtime = statSync(dirPath).mtimeMs
+            const subs = ['db_storage', 'msg/video', 'msg/attach']
+            for (const sub of subs) {
+                const p = join(dirPath, sub)
+                if (existsSync(p)) mtime = Math.max(mtime, statSync(p).mtimeMs)
+            }
+            return mtime
+        } catch { return 0 }
+    }
+
+    private async ensureWcdbReady(): Promise<boolean> {
+        if (wcdbService.isReady()) return true
+        const dbPath = this.configService.get('dbPath')
+        const decryptKey = this.configService.get('decryptKey')
+        const wxid = this.configService.get('myWxid')
+        if (!dbPath || !decryptKey || !wxid) return false
+        const cleanedWxid = this.cleanWxid(wxid)
+        return await wcdbService.open(dbPath, decryptKey, cleanedWxid)
+    }
+
+    /**
+     * 计算会话哈希（对应磁盘目录名）
+     */
+    private md5Hash(text: string): string {
+        return crypto.createHash('md5').update(text).digest('hex')
+    }
+
+    private async resolveHardlinkPath(accountDir: string, md5: string): Promise<string | null> {
+        const dbPath = join(accountDir, 'db_storage', 'hardlink', 'hardlink.db')
+        if (!existsSync(dbPath)) {
+            this.logInfo('hardlink.db 不存在', { dbPath })
+            return null
+        }
+
+        try {
+            const ready = await this.ensureWcdbReady()
+            if (!ready) return null
+
+            const tableResult = await wcdbService.execQuery('media', dbPath, 
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'video_hardlink_info%' ORDER BY name DESC LIMIT 1")
+            
+            if (!tableResult.success || !tableResult.rows?.length) return null
+            const tableName = tableResult.rows[0].name
+
+            const escapedMd5 = md5.replace(/'/g, "''")
+            const rowResult = await wcdbService.execQuery('media', dbPath, 
+                `SELECT dir1, dir2, file_name FROM ${tableName} WHERE lower(md5) = lower('${escapedMd5}') LIMIT 1`)
+            
+            if (!rowResult.success || !rowResult.rows?.length) return null
+            
+            const row = rowResult.rows[0]
+            const dir1 = row.dir1 ?? row.DIR1
+            const dir2 = row.dir2 ?? row.DIR2
+            const file_name = row.file_name ?? row.fileName ?? row.FILE_NAME
+
+            if (dir1 === undefined || dir2 === undefined || !file_name) return null
+
+            const dirTableResult = await wcdbService.execQuery('media', dbPath, 
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'dir2id%' LIMIT 1")
+            if (!dirTableResult.success || !dirTableResult.rows?.length) return null
+            const dirTable = dirTableResult.rows[0].name
+
+            const getDirName = async (id: number) => {
+                const res = await wcdbService.execQuery('media', dbPath, `SELECT username FROM ${dirTable} WHERE rowid = ${id} LIMIT 1`)
+                return res.success && res.rows?.length ? String(res.rows[0].username) : null
+            }
+
+            const dir1Name = await getDirName(Number(dir1))
+            const dir2Name = await getDirName(Number(dir2))
+            if (!dir1Name || !dir2Name) return null
+
+            const candidates = [
+                join(accountDir, 'msg', 'attach', dir1Name, dir2Name, 'Video', file_name),
+                join(accountDir, 'msg', 'attach', dir1Name, dir2Name, file_name),
+                join(accountDir, 'msg', 'video', dir2Name, file_name)
+            ]
+
+            for (const p of candidates) {
+                if (existsSync(p)) {
+                    this.logInfo('hardlink 命中', { path: p })
+                    return p
+                }
+            }
+        } catch (e) {
+            this.logError('resolveHardlinkPath 异常', e)
+        }
+        return null
+    }
+
+    private async searchVideoFile(accountDir: string, md5: string, sessionId?: string): Promise<string | null> {
+        const lowerMd5 = md5.toLowerCase()
+        
+        // 策略 1: 基于 sessionId 哈希的精准搜索 (XWeChat 核心逻辑)
+        if (sessionId) {
+            const sessHash = this.md5Hash(sessionId)
+            const attachRoot = join(accountDir, 'msg', 'attach', sessHash)
+            if (existsSync(attachRoot)) {
+                try {
+                    const monthDirs = readdirSync(attachRoot).filter(d => /^\d{4}-\d{2}$/.test(d))
+                    for (const m of monthDirs) {
+                        const videoDir = join(attachRoot, m, 'Video')
+                        if (existsSync(videoDir)) {
+                            // 尝试精确名和带数字后缀的名
+                            const files = readdirSync(videoDir)
+                            const match = files.find(f => f.toLowerCase().startsWith(lowerMd5) && f.toLowerCase().endsWith('.mp4'))
+                            if (match) return join(videoDir, match)
+                        }
+                    }
+                } catch { }
+            }
+        }
+
+        // 策略 2: 概率搜索所有 session 目录 (针对最近 3 个月)
+        const attachRoot = join(accountDir, 'msg', 'attach')
+        if (existsSync(attachRoot)) {
+            try {
+                const sessionDirs = readdirSync(attachRoot).filter(d => d.length === 32)
+                const now = new Date()
+                const months = []
+                for (let i = 0; i < 3; i++) {
+                    const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
+                    months.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`)
+                }
+
+                for (const sess of sessionDirs) {
+                    for (const month of months) {
+                        const videoDir = join(attachRoot, sess, month, 'Video')
+                        if (existsSync(videoDir)) {
+                            const files = readdirSync(videoDir)
+                            const match = files.find(f => f.toLowerCase().startsWith(lowerMd5) && f.toLowerCase().endsWith('.mp4'))
+                            if (match) return join(videoDir, match)
+                        }
+                    }
+                }
+            } catch { }
+        }
+
+        // 策略 3: 传统 msg/video 目录
+        const videoRoot = join(accountDir, 'msg', 'video')
+        if (existsSync(videoRoot)) {
+            try {
+                const monthDirs = readdirSync(videoRoot).sort().reverse()
+                for (const m of monthDirs) {
+                    const dirPath = join(videoRoot, m)
+                    const files = readdirSync(dirPath)
+                    const match = files.find(f => f.toLowerCase().startsWith(lowerMd5) && f.toLowerCase().endsWith('.mp4'))
+                    if (match) return join(dirPath, match)
+                }
+            } catch { }
+        }
+
+        return null
+    }
+
+    private getXorKey(): number | undefined {
+        const raw = this.configService.get('imageXorKey')
+        if (typeof raw === 'number') return raw
+        if (typeof raw === 'string') {
+            const t = raw.trim()
+            return t.toLowerCase().startsWith('0x') ? parseInt(t, 16) : parseInt(t, 10)
         }
         return undefined
     }
 
-    /**
-     * 将文件转换为 data URL
-     */
-    private fileToDataUrl(filePath: string, mimeType: string): string | undefined {
-        try {
-            if (!existsSync(filePath)) return undefined
-            const buffer = readFileSync(filePath)
-            return `data:${mimeType};base64,${buffer.toString('base64')}`
-        } catch {
-            return undefined
+    private isEncrypted(buffer: Buffer, xorKey: number, type: 'video' | 'image'): boolean {
+        if (buffer.length < 8) return false
+        const first = buffer[0] ^ xorKey
+        const second = buffer[1] ^ xorKey
+        
+        if (type === 'image') {
+            return (first === 0xFF && second === 0xD8) || (first === 0x89 && second === 0x50) || (first === 0x47 && second === 0x49)
+        } else {
+            // MP4 头部通常包含 'ftyp'
+            const f = buffer[4] ^ xorKey
+            const t = buffer[5] ^ xorKey
+            const y = buffer[6] ^ xorKey
+            const p = buffer[7] ^ xorKey
+            return (f === 0x66 && t === 0x74 && y === 0x79 && p === 0x70) || // 'ftyp'
+                   (buffer[0] ^ xorKey) === 0x00 && (buffer[1] ^ xorKey) === 0x00 // 一些 mp4 以 00 00 开头
         }
     }
 
-    /**
-     * 根据视频MD5获取视频文件信息
-     * 视频存放在: {数据库根目录}/{用户wxid}/msg/video/{年月}/
-     * 文件命名: {md5}.mp4, {md5}.jpg, {md5}_thumb.jpg
-     */
-    async getVideoInfo(videoMd5: string): Promise<VideoInfo> {
-        const dbPath = this.getDbPath()
-        const wxid = this.getMyWxid()
-
-        if (!dbPath || !wxid || !videoMd5) {
-            return { exists: false }
-        }
-
-        // 先尝试从数据库查询真正的视频文件名
-        const realVideoMd5 = await this.queryVideoFileName(videoMd5) || videoMd5
-
-        // 检查 dbPath 是否已经包含 wxid，避免重复拼接
-        const dbPathLower = dbPath.toLowerCase()
-        const wxidLower = wxid.toLowerCase()
-        const cleanedWxid = this.cleanWxid(wxid)
-
-        let videoBaseDir: string
-        if (dbPathLower.includes(wxidLower) || dbPathLower.includes(cleanedWxid.toLowerCase())) {
-            // dbPath 已经包含 wxid，直接使用
-            videoBaseDir = join(dbPath, 'msg', 'video')
-        } else {
-            // dbPath 不包含 wxid，需要拼接
-            videoBaseDir = join(dbPath, wxid, 'msg', 'video')
-        }
-
-        if (!existsSync(videoBaseDir)) {
-            return { exists: false }
-        }
-
-        // 遍历年月目录查找视频文件
+    private filePathToUrl(filePath: string): string {
         try {
-            const allDirs = readdirSync(videoBaseDir)
+            const { pathToFileURL } = require('url')
+            const url = pathToFileURL(filePath).toString()
+            const s = statSync(filePath)
+            return `${url}?v=${Math.floor(s.mtimeMs)}`
+        } catch {
+            return `file:///${filePath.replace(/\\/g, '/')}`
+        }
+    }
 
-            // 支持多种目录格式: YYYY-MM, YYYYMM, 或其他
-            const yearMonthDirs = allDirs
-                .filter(dir => {
-                    const dirPath = join(videoBaseDir, dir)
-                    return statSync(dirPath).isDirectory()
-                })
-                .sort((a, b) => b.localeCompare(a)) // 从最新的目录开始查找
+    private handleFile(filePath: string, type: 'video' | 'image', sessionId?: string): string | undefined {
+        if (!existsSync(filePath)) return undefined
+        const xorKey = this.getXorKey()
+        
+        try {
+            const buffer = readFileSync(filePath)
+            const isEnc = xorKey !== undefined && !Number.isNaN(xorKey) && this.isEncrypted(buffer, xorKey, type)
 
-            for (const yearMonth of yearMonthDirs) {
-                const dirPath = join(videoBaseDir, yearMonth)
-
-                const videoPath = join(dirPath, `${realVideoMd5}.mp4`)
-                const coverPath = join(dirPath, `${realVideoMd5}.jpg`)
-                const thumbPath = join(dirPath, `${realVideoMd5}_thumb.jpg`)
-
-                // 检查视频文件是否存在
-                if (existsSync(videoPath)) {
-                    return {
-                        videoUrl: videoPath,  // 返回文件路径，前端通过 readFile 读取
-                        coverUrl: this.fileToDataUrl(coverPath, 'image/jpeg'),
-                        thumbUrl: this.fileToDataUrl(thumbPath, 'image/jpeg'),
-                        exists: true
+            if (isEnc) {
+                const decrypted = Buffer.alloc(buffer.length)
+                for (let i = 0; i < buffer.length; i++) decrypted[i] = buffer[i] ^ xorKey!
+                
+                if (type === 'image') {
+                    return `data:image/jpeg;base64,${decrypted.toString('base64')}`
+                } else {
+                    const cacheDir = join(this.getCacheBasePath(), 'Videos', this.cleanWxid(sessionId || 'unknown'))
+                    if (!existsSync(cacheDir)) mkdirSync(cacheDir, { recursive: true })
+                    const outPath = join(cacheDir, `${basename(filePath)}`)
+                    if (!existsSync(outPath) || statSync(outPath).size !== decrypted.length) {
+                        writeFileSync(outPath, decrypted)
                     }
+                    return this.filePathToUrl(outPath)
                 }
             }
+
+            if (type === 'image') {
+                return `data:image/jpeg;base64,${buffer.toString('base64')}`
+            }
+            return this.filePathToUrl(filePath)
         } catch (e) {
-            // 忽略错误
+            this.logError(`处理${type}文件异常: ${filePath}`, e)
+            return type === 'image' ? undefined : this.filePathToUrl(filePath)
+        }
+    }
+
+    async getVideoInfo(videoMd5: string, sessionId?: string): Promise<VideoInfo> {
+        this.logInfo('获取视频信息', { videoMd5, sessionId })
+        const dbPath = this.getDbPath()
+        const wxid = this.getMyWxid()
+        if (!dbPath || !wxid || !videoMd5) return { exists: false }
+
+        const accountDir = this.resolveAccountDir(dbPath, wxid)
+        if (!accountDir) {
+            this.logError('未找到账号目录', undefined, { dbPath, wxid })
+            return { exists: false }
         }
 
+        // 1. 通过 hardlink 映射
+        let videoPath = await this.resolveHardlinkPath(accountDir, videoMd5)
+        
+        // 2. 启发式搜索
+        if (!videoPath) {
+            videoPath = await this.searchVideoFile(accountDir, videoMd5, sessionId)
+        }
+
+        if (videoPath && existsSync(videoPath)) {
+            this.logInfo('定位成功', { videoPath })
+            const base = videoPath.slice(0, -4)
+            const coverPath = `${base}.jpg`
+            const thumbPath = `${base}_thumb.jpg`
+
+            return {
+                videoUrl: this.handleFile(videoPath, 'video', sessionId),
+                coverUrl: this.handleFile(coverPath, 'image', sessionId),
+                thumbUrl: this.handleFile(thumbPath, 'image', sessionId),
+                exists: true
+            }
+        }
+
+        this.logInfo('定位失败', { videoMd5 })
         return { exists: false }
     }
 
-    /**
-     * 根据消息内容解析视频MD5
-     */
     parseVideoMd5(content: string): string | undefined {
-
-        // 打印前500字符看看 XML 结构
-
         if (!content) return undefined
-
         try {
-            // 提取所有可能的 md5 值进行日志
-            const allMd5s: string[] = []
-            const md5Regex = /(?:md5|rawmd5|newmd5|originsourcemd5)\s*=\s*['"]([a-fA-F0-9]+)['"]/gi
-            let match
-            while ((match = md5Regex.exec(content)) !== null) {
-                allMd5s.push(`${match[0]}`)
-            }
-
-            // 提取 md5（用于查询 hardlink.db）
-            // 注意：不是 rawmd5，rawmd5 是另一个值
-            // 格式: md5="xxx" 或 <md5>xxx</md5>
-
-            // 尝试从videomsg标签中提取md5
-            const videoMsgMatch = /<videomsg[^>]*\smd5\s*=\s*['"]([a-fA-F0-9]+)['"]/i.exec(content)
-            if (videoMsgMatch) {
-                return videoMsgMatch[1].toLowerCase()
-            }
-
-            const attrMatch = /\smd5\s*=\s*['"]([a-fA-F0-9]+)['"]/i.exec(content)
-            if (attrMatch) {
-                return attrMatch[1].toLowerCase()
-            }
-
-            const md5Match = /<md5>([a-fA-F0-9]+)<\/md5>/i.exec(content)
-            if (md5Match) {
-                return md5Match[1].toLowerCase()
-            }
-        } catch (e) {
-            console.error('[VideoService] 解析视频MD5失败:', e)
-        }
-
-        return undefined
+            const m = /<videomsg[^>]*\smd5\s*=\s*['"]([a-fA-F0-9]+)['"]/i.exec(content) || 
+                    /\smd5\s*=\s*['"]([a-fA-F0-9]+)['"]/i.exec(content) ||
+                    /<md5>([a-fA-F0-9]+)<\/md5>/i.exec(content)
+            return m ? m[1].toLowerCase() : undefined
+        } catch { return undefined }
     }
 }
 
