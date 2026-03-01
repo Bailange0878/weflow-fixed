@@ -1238,11 +1238,9 @@ function ChatPage(_props: ChatPageProps) {
     setJumpStartTime(0)
     setJumpEndTime(0)
     void loadMessages(session.username, 0, 0, 0)
-    // 重置详情面板
+    // 切换会话后回到正常聊天窗口：收起详情侧栏，详情需手动再次展开
+    setShowDetailPanel(false)
     setSessionDetail(null)
-    if (showDetailPanel) {
-      void loadSessionDetail(session.username)
-    }
   }
 
   // 搜索过滤
