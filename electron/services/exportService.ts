@@ -2222,12 +2222,23 @@ class ExportService {
         return null
       }
 
-      const result = await imageDecryptService.decryptImage({
+      // 无损导出优先：先尝试高清/原图，再退化到缩略图
+      let result = await imageDecryptService.decryptImage({
         sessionId,
         imageMd5,
         imageDatName,
-        force: false  // 先尝试缩略图
+        force: true
       })
+
+      if (!result.success || !result.localPath) {
+        console.log(`[Export] 高清图获取失败 (localId=${msg.localId}): imageMd5=${imageMd5}, imageDatName=${imageDatName}, error=${result.error || '未知'} → 尝试普通/缩略图`)
+        result = await imageDecryptService.decryptImage({
+          sessionId,
+          imageMd5,
+          imageDatName,
+          force: false
+        })
+      }
 
       if (!result.success || !result.localPath) {
         console.log(`[Export] 图片解密失败 (localId=${msg.localId}): imageMd5=${imageMd5}, imageDatName=${imageDatName}, error=${result.error || '未知'}`)
@@ -2451,28 +2462,101 @@ class ExportService {
 
   /**
    * 从消息内容提取图片 MD5
+   * 兼容：<img md5="..."> / <md5>...</md5> / 任意属性里的 md5="..."
    */
   private extractImageMd5(content: string): string | undefined {
     if (!content) return undefined
-    const match = /md5="([^"]+)"/i.exec(content)
-    return match?.[1]
+
+    const normalized = this.normalizeAppMessageContent(content)
+
+    const candidates = [
+      this.extractXmlAttribute(normalized, 'img', 'md5'),
+      this.extractXmlValue(normalized, 'md5'),
+      /(?:^|\s)md5\s*=\s*['"]([a-fA-F0-9]{16,64})['"]/i.exec(normalized)?.[1],
+      /<md5>([a-fA-F0-9]{16,64})<\/md5>/i.exec(normalized)?.[1]
+    ]
+
+    for (const item of candidates) {
+      const value = String(item || '').trim()
+      if (value && /^[a-fA-F0-9]{16,64}$/.test(value)) {
+        return value.toLowerCase()
+      }
+    }
+
+    return undefined
+  }
+
+  private extractImageUrlLike(content: string, tagOrAttr: string): string | undefined {
+    if (!content) return undefined
+    const normalized = this.normalizeAppMessageContent(content)
+
+    const attrMatch = new RegExp(`${tagOrAttr}\\s*=\\s*['"]([^'"]+)['"]`, 'i').exec(normalized)
+      || new RegExp(`${tagOrAttr}\\s*=\\s*([^'"\\s>]+)`, 'i').exec(normalized)
+    if (attrMatch?.[1]) {
+      return attrMatch[1].replace(/&amp;/g, '&').trim()
+    }
+
+    const tagValue = this.extractXmlValue(normalized, tagOrAttr)
+    if (tagValue) {
+      return tagValue.replace(/&amp;/g, '&').trim()
+    }
+
+    return undefined
   }
 
   /**
-   * 从消息内容提取图片 DAT 文件名
+   * 从消息内容提取图片 DAT 文件名/缓存键
+   * 优先从显式字段取；取不到再从 cdnthumburl / thumburl / cdnbigimgurl / cdnmidimgurl 推断
    */
   private extractImageDatName(content: string): string | undefined {
     if (!content) return undefined
-    // 尝试从 cdnthumburl 或其他字段提取
-    const urlMatch = /cdnthumburl[^>]*>([^<]+)/i.exec(content)
-    if (urlMatch) {
-      const urlParts = urlMatch[1].split('/')
-      const last = urlParts[urlParts.length - 1]
-      if (last && last.includes('_')) {
+
+    const normalized = this.normalizeAppMessageContent(content)
+    const directCandidates = [
+      this.extractXmlAttribute(normalized, 'img', 'datfile'),
+      this.extractXmlAttribute(normalized, 'img', 'datfilename'),
+      this.extractXmlAttribute(normalized, 'img', 'cdnmidimgurl'),
+      this.extractXmlAttribute(normalized, 'img', 'cdnbigimgurl'),
+      this.extractXmlAttribute(normalized, 'img', 'cdnthumburl'),
+      this.extractXmlValue(normalized, 'cdnmidimgurl'),
+      this.extractXmlValue(normalized, 'cdnbigimgurl'),
+      this.extractXmlValue(normalized, 'cdnthumburl'),
+      this.extractXmlValue(normalized, 'thumburl')
+    ]
+
+    const urlCandidates = [
+      ...directCandidates,
+      this.extractImageUrlLike(normalized, 'cdnthumburl'),
+      this.extractImageUrlLike(normalized, 'thumburl'),
+      this.extractImageUrlLike(normalized, 'cdnmidimgurl'),
+      this.extractImageUrlLike(normalized, 'cdnbigimgurl')
+    ]
+
+    for (const candidate of urlCandidates) {
+      const value = String(candidate || '').trim()
+      if (!value) continue
+
+      const last = value.split('/').pop()?.split('?')[0]?.trim() || ''
+      if (!last) continue
+
+      if (/\.(dat|jpg|jpeg|png|webp|gif)$/i.test(last)) {
+        return last.replace(/\.(dat|jpg|jpeg|png|webp|gif)$/i, '')
+      }
+
+      if (last.includes('_')) {
         return last.split('_')[0]
       }
+
+      if (/^[a-fA-F0-9]{16,64}$/.test(last)) {
+        return last.toLowerCase()
+      }
+
+      if (/^[A-Za-z0-9_-]{8,}$/.test(last)) {
+        return last
+      }
     }
-    return undefined
+
+    return this.extractImageMd5(normalized)
   }
 
   /**
@@ -2509,12 +2593,29 @@ class ExportService {
 
   private extractVideoMd5(content: string): string | undefined {
     if (!content) return undefined
-    const attrMatch = /<videomsg[^>]*\smd5\s*=\s*['"]([a-fA-F0-9]+)['"]/i.exec(content)
+
+    const videoMsgMd5Match = /<videomsg[^>]*\smd5\s*=\s*['"]([a-fA-F0-9]+)['"]/i.exec(content)
+    if (videoMsgMd5Match) {
+      return videoMsgMd5Match[1].toLowerCase()
+    }
+
+    const rawMd5Match = /<videomsg[^>]*\srawmd5\s*=\s*['"]([a-fA-F0-9]+)['"]/i.exec(content)
+    if (rawMd5Match) {
+      return rawMd5Match[1].toLowerCase()
+    }
+
+    const attrMatch = /(?<![a-z])md5\s*=\s*['"]([a-fA-F0-9]+)['"]/i.exec(content)
     if (attrMatch) {
       return attrMatch[1].toLowerCase()
     }
+
     const tagMatch = /<md5>([^<]+)<\/md5>/i.exec(content)
-    return tagMatch?.[1]?.toLowerCase()
+    if (tagMatch?.[1]) {
+      return tagMatch[1].toLowerCase()
+    }
+
+    const rawMd5Fallback = /\srawmd5\s*=\s*['"]([a-fA-F0-9]+)['"]/i.exec(content)
+    return rawMd5Fallback?.[1]?.toLowerCase()
   }
 
   private extractLocationMeta(content: string, localType: number): {

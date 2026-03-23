@@ -520,14 +520,14 @@ export class ImageDecryptService {
       this.logInfo('[ImageDecrypt] hardlink miss (datName)', { imageDatName })
     }
 
-    // 如果要求高清图但 hardlink 没找到，也不要搜索了（搜索太慢）
-    if (!allowThumbnail) {
-      return null
-    }
+    // 高清图优先模式下，也继续尝试按 datName 搜索，避免 hardlink 缺失时过早放弃。
+    // 这里先走已有的 searchDatFile 限定搜索，不做无限制全盘暴力扫描。
+    if (!imageDatName && !imageMd5) return null
 
-    if (!imageDatName) return null
+    const fallbackKey = imageDatName || imageMd5
+    if (!fallbackKey) return null
     if (!skipResolvedCache) {
-      const cached = this.resolvedCache.get(imageDatName)
+      const cached = this.resolvedCache.get(fallbackKey)
       if (cached && existsSync(cached)) {
         const preferred = this.getPreferredDatVariantPath(cached, allowThumbnail)
         if (allowThumbnail || !this.isThumbnailPath(preferred)) return preferred
@@ -537,24 +537,28 @@ export class ImageDecryptService {
       }
     }
 
-    const datPath = await this.searchDatFile(accountDir, imageDatName, allowThumbnail)
+    const datPath = await this.searchDatFile(accountDir, fallbackKey, allowThumbnail)
     if (datPath) {
-      this.logInfo('[ImageDecrypt] searchDatFile hit', { imageDatName, path: datPath })
-      this.resolvedCache.set(imageDatName, datPath)
-      this.cacheDatPath(accountDir, imageDatName, datPath)
+      this.logInfo('[ImageDecrypt] searchDatFile hit', { imageDatName: fallbackKey, path: datPath })
+      this.resolvedCache.set(fallbackKey, datPath)
+      this.cacheDatPath(accountDir, fallbackKey, datPath)
+      if (imageMd5 && imageMd5 !== fallbackKey) this.cacheDatPath(accountDir, imageMd5, datPath)
+      if (imageDatName && imageDatName !== fallbackKey) this.cacheDatPath(accountDir, imageDatName, datPath)
       return datPath
     }
-    const normalized = this.normalizeDatBase(imageDatName)
-    if (normalized !== imageDatName.toLowerCase()) {
+    const normalized = this.normalizeDatBase(fallbackKey)
+    if (normalized !== fallbackKey.toLowerCase()) {
       const normalizedPath = await this.searchDatFile(accountDir, normalized, allowThumbnail)
       if (normalizedPath) {
-        this.logInfo('[ImageDecrypt] searchDatFile hit (normalized)', { imageDatName, normalized, path: normalizedPath })
-        this.resolvedCache.set(imageDatName, normalizedPath)
-        this.cacheDatPath(accountDir, imageDatName, normalizedPath)
+        this.logInfo('[ImageDecrypt] searchDatFile hit (normalized)', { imageDatName: fallbackKey, normalized, path: normalizedPath })
+        this.resolvedCache.set(fallbackKey, normalizedPath)
+        this.cacheDatPath(accountDir, fallbackKey, normalizedPath)
+        if (imageMd5 && imageMd5 !== fallbackKey) this.cacheDatPath(accountDir, imageMd5, normalizedPath)
+        if (imageDatName && imageDatName !== fallbackKey) this.cacheDatPath(accountDir, imageDatName, normalizedPath)
         return normalizedPath
       }
     }
-    this.logInfo('[ImageDecrypt] resolveDatPath miss', { imageDatName, normalized })
+    this.logInfo('[ImageDecrypt] resolveDatPath miss', { imageDatName: fallbackKey, normalized })
     return null
   }
 

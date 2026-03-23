@@ -1,0 +1,51 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - 'electron/**'
+      - 'src/**'
+      - 'public/**'
+      - 'scripts/**'
+      - 'vite.config.*'
+      - 'tsconfig*.json'
+      - '.github/workflows/build-windows.yml'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          npx electron-builder --win nsis --publish never
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: weflow-windows-installer
+          path: |
+            release/*.exe
+            release/*.yml
+          if-no-files-found: error
+          retention-days: 14

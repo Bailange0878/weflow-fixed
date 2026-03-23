@@ -69,7 +69,7 @@ class VideoService {
     }
 
     /**
-     * 从 video_hardlink_info_v4 表查询视频文件名
+     * 从 video_hardlink_info* 表查询视频文件名
      * 使用 wcdbService.execQuery 查询加密的 hardlink.db
      */
     private async queryVideoFileName(md5: string): Promise<string | undefined> {
@@ -104,18 +104,24 @@ class VideoService {
                     try {
                         this.log('尝试加密 hardlink.db', { path: p })
                         const escapedMd5 = md5.replace(/'/g, "''")
-                        const sql = `SELECT file_name FROM video_hardlink_info_v4 WHERE md5 = '${escapedMd5}' LIMIT 1`
-                        const result = await wcdbService.execQuery('media', p, sql)
+                        const tableProbe = await wcdbService.execQuery('media', p, "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'video_hardlink_info%'")
+                        const tableNames = (tableProbe.success && tableProbe.rows ? tableProbe.rows.map((row: any) => String(row.name || '').trim()).filter(Boolean) : [])
+                        const candidates = tableNames.length > 0 ? tableNames.reverse() : ['video_hardlink_info_v4']
 
-                        if (result.success && result.rows && result.rows.length > 0) {
-                            const row = result.rows[0]
-                            if (row?.file_name) {
-                                const realMd5 = String(row.file_name).replace(/\.[^.]+$/, '')
-                                this.log('加密 hardlink.db 命中', { file_name: row.file_name, realMd5 })
-                                return realMd5
+                        for (const tableName of candidates) {
+                            const sql = `SELECT file_name FROM ${tableName} WHERE md5 = '${escapedMd5}' LIMIT 1`
+                            const result = await wcdbService.execQuery('media', p, sql)
+                            if (result.success && result.rows && result.rows.length > 0) {
+                                const row = result.rows[0]
+                                if (row?.file_name) {
+                                    const realMd5 = String(row.file_name).replace(/\.[^.]+$/, '')
+                                    this.log('加密 hardlink.db 命中', { tableName, file_name: row.file_name, realMd5 })
+                                    return realMd5
+                                }
                             }
                         }
-                        this.log('加密 hardlink.db 未命中', { path: p, result: JSON.stringify(result).slice(0, 200) })
+
+                        this.log('加密 hardlink.db 未命中', { path: p, tables: candidates })
                     } catch (e) {
                         this.log('加密 hardlink.db 查询失败', { path: p, error: String(e) })
                     }
@@ -125,6 +131,37 @@ class VideoService {
             }
         }
         this.log('queryVideoFileName: 所有方法均未找到', { md5 })
+        return undefined
+    }
+
+    private findExistingFile(candidates: string[]): string | undefined {
+        for (const candidate of candidates) {
+            if (existsSync(candidate)) return candidate
+        }
+        return undefined
+    }
+
+    private searchVideoFileInDir(dirPath: string, baseNames: string[], exts: string[]): string | undefined {
+        if (!existsSync(dirPath)) return undefined
+        try {
+            const allFiles = readdirSync(dirPath)
+            for (const baseName of baseNames) {
+                const lowerBase = baseName.toLowerCase()
+                const direct = allFiles.find((file) => {
+                    const lower = file.toLowerCase()
+                    return exts.some((ext) => lower === `${lowerBase}${ext}` || lower === `${lowerBase}_raw${ext}`)
+                })
+                if (direct) return join(dirPath, direct)
+
+                const fuzzy = allFiles.find((file) => {
+                    const lower = file.toLowerCase()
+                    return lower.startsWith(lowerBase) && exts.some((ext) => lower.endsWith(ext))
+                })
+                if (fuzzy) return join(dirPath, fuzzy)
+            }
+        } catch (e) {
+            this.log('searchVideoFileInDir 异常', { dirPath, error: String(e) })
+        }
         return undefined
     }
 
@@ -192,23 +229,37 @@ class VideoService {
 
             this.log('扫描目录', { dirs: yearMonthDirs })
 
+            const videoExts = ['.mp4', '.mov', '.m4v']
+            const baseNames = Array.from(new Set([
+                realVideoMd5,
+                realVideoMd5.replace(/_raw$/i, ''),
+                videoMd5,
+                videoMd5.replace(/_raw$/i, '')
+            ].filter(Boolean)))
+
             for (const yearMonth of yearMonthDirs) {
                 const dirPath = join(videoBaseDir, yearMonth)
-                const videoPath = join(dirPath, `${realVideoMd5}.mp4`)
+                const videoPath = this.searchVideoFileInDir(dirPath, baseNames, videoExts)
 
-                if (existsSync(videoPath)) {
+                if (videoPath) {
                     // 封面/缩略图使用不带 _raw 后缀的基础名（自己发的视频文件名带 _raw，但封面不带）
                     const baseMd5 = realVideoMd5.replace(/_raw$/, '')
-                    const coverPath = join(dirPath, `${baseMd5}.jpg`)
-                    const thumbPath = join(dirPath, `${baseMd5}_thumb.jpg`)
+                    const coverPath = this.findExistingFile([
+                        join(dirPath, `${baseMd5}.jpg`),
+                        join(dirPath, `${videoMd5}.jpg`)
+                    ])
+                    const thumbPath = this.findExistingFile([
+                        join(dirPath, `${baseMd5}_thumb.jpg`),
+                        join(dirPath, `${videoMd5}_thumb.jpg`)
+                    ])
 
                     // 列出同目录下与该 md5 相关的所有文件，帮助排查封面命名
                     const allFiles = readdirSync(dirPath)
-                    const relatedFiles = allFiles.filter(f => f.toLowerCase().startsWith(realVideoMd5.slice(0, 8).toLowerCase()))
+                    const relatedFiles = allFiles.filter(f => baseNames.some((name) => f.toLowerCase().startsWith(name.slice(0, 8).toLowerCase())))
                     this.log('找到视频，相关文件列表', {
                         videoPath,
-                        coverExists: existsSync(coverPath),
-                        thumbExists: existsSync(thumbPath),
+                        coverExists: !!coverPath,
+                        thumbExists: !!thumbPath,
                         relatedFiles,
                         coverPath,
                         thumbPath
@@ -216,8 +267,25 @@ class VideoService {
 
                     return {
                         videoUrl: videoPath,
-                        coverUrl: this.fileToDataUrl(coverPath, 'image/jpeg'),
-                        thumbUrl: this.fileToDataUrl(thumbPath, 'image/jpeg'),
+                        coverUrl: coverPath ? this.fileToDataUrl(coverPath, 'image/jpeg') : undefined,
+                        thumbUrl: thumbPath ? this.fileToDataUrl(thumbPath, 'image/jpeg') : undefined,
+                        exists: true
+                    }
+                }
+            }
+
+            // fallback: 尝试旧 FileStorage/Video 目录
+            const dbPathContainsWxid = dbPathLower.includes(wxidLower) || dbPathLower.includes(cleanedWxid.toLowerCase())
+            const fileStorageVideoDir = dbPathContainsWxid
+                ? join(dbPath, 'FileStorage', 'Video')
+                : join(dbPath, wxid, 'FileStorage', 'Video')
+
+            if (existsSync(fileStorageVideoDir)) {
+                const fallbackVideoPath = this.searchVideoFileInDir(fileStorageVideoDir, baseNames, videoExts)
+                if (fallbackVideoPath) {
+                    this.log('在 FileStorage/Video 中找到视频', { fallbackVideoPath })
+                    return {
+                        videoUrl: fallbackVideoPath,
                         exists: true
                     }
                 }
