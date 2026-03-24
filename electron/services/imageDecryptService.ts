@@ -60,6 +60,18 @@ type HardlinkState = {
   dirTable?: string
 }
 
+type CachedImagePayload = {
+  sessionId?: string
+  imageMd5?: string
+  imageDatName?: string
+  preferFilePath?: boolean
+}
+
+type DecryptImagePayload = CachedImagePayload & {
+  force?: boolean
+  hardlinkOnly?: boolean
+}
+
 export class ImageDecryptService {
   private configService = new ConfigService()
   private hardlinkCache = new Map<string, HardlinkState>()
@@ -106,7 +118,7 @@ export class ImageDecryptService {
     }
   }
 
-  async resolveCachedImage(payload: { sessionId?: string; imageMd5?: string; imageDatName?: string }): Promise<DecryptResult & { hasUpdate?: boolean }> {
+  async resolveCachedImage(payload: CachedImagePayload): Promise<DecryptResult & { hasUpdate?: boolean }> {
     await this.ensureCacheIndexed()
     const cacheKeys = this.getCacheKeys(payload)
     const cacheKey = cacheKeys[0]
@@ -116,7 +128,7 @@ export class ImageDecryptService {
     for (const key of cacheKeys) {
       const cached = this.resolvedCache.get(key)
       if (cached && existsSync(cached) && this.isImageFile(cached)) {
-        const dataUrl = this.fileToDataUrl(cached)
+        const localPath = this.resolveLocalPathForPayload(cached, payload.preferFilePath)
         const isThumb = this.isThumbnailPath(cached)
         const hasUpdate = isThumb ? (this.updateFlags.get(key) ?? false) : false
         if (isThumb) {
@@ -124,8 +136,8 @@ export class ImageDecryptService {
         } else {
           this.updateFlags.delete(key)
         }
-        this.emitCacheResolved(payload, key, dataUrl || this.filePathToUrl(cached))
-        return { success: true, localPath: dataUrl || this.filePathToUrl(cached), hasUpdate }
+        this.emitCacheResolved(payload, key, this.resolveEmitPath(cached, payload.preferFilePath))
+        return { success: true, localPath, hasUpdate }
       }
       if (cached && !this.isImageFile(cached)) {
         this.resolvedCache.delete(key)
@@ -136,7 +148,7 @@ export class ImageDecryptService {
       const existing = this.findCachedOutput(key, false, payload.sessionId)
       if (existing) {
         this.cacheResolvedPaths(key, payload.imageMd5, payload.imageDatName, existing)
-        const dataUrl = this.fileToDataUrl(existing)
+        const localPath = this.resolveLocalPathForPayload(existing, payload.preferFilePath)
         const isThumb = this.isThumbnailPath(existing)
         const hasUpdate = isThumb ? (this.updateFlags.get(key) ?? false) : false
         if (isThumb) {
@@ -144,27 +156,57 @@ export class ImageDecryptService {
         } else {
           this.updateFlags.delete(key)
         }
-        this.emitCacheResolved(payload, key, dataUrl || this.filePathToUrl(existing))
-        return { success: true, localPath: dataUrl || this.filePathToUrl(existing), hasUpdate }
+        this.emitCacheResolved(payload, key, this.resolveEmitPath(existing, payload.preferFilePath))
+        return { success: true, localPath, hasUpdate }
       }
     }
     this.logInfo('未找到缓存', { md5: payload.imageMd5, datName: payload.imageDatName })
     return { success: false, error: '未找到缓存图片' }
   }
 
-  async decryptImage(payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean }): Promise<DecryptResult> {
-    await this.ensureCacheIndexed()
-    const cacheKey = payload.imageMd5 || payload.imageDatName
+  async decryptImage(payload: DecryptImagePayload): Promise<DecryptResult> {
+    if (!payload.hardlinkOnly) {
+      await this.ensureCacheIndexed()
+    }
+    const cacheKeys = this.getCacheKeys(payload)
+    const cacheKey = cacheKeys[0]
     if (!cacheKey) {
       return { success: false, error: '缺少图片标识' }
+    }
+
+    if (payload.force) {
+      for (const key of cacheKeys) {
+        const cached = this.resolvedCache.get(key)
+        if (cached && existsSync(cached) && this.isImageFile(cached) && !this.isThumbnailPath(cached)) {
+          this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, cached)
+          this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
+          const localPath = this.resolveLocalPathForPayload(cached, payload.preferFilePath)
+          this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(cached, payload.preferFilePath))
+          return { success: true, localPath }
+        }
+        if (cached && !this.isImageFile(cached)) {
+          this.resolvedCache.delete(key)
+        }
+      }
+
+      if (!payload.hardlinkOnly) {
+        for (const key of cacheKeys) {
+          const existingHd = this.findCachedOutput(key, true, payload.sessionId)
+          if (!existingHd || this.isThumbnailPath(existingHd)) continue
+          this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, existingHd)
+          this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
+          const localPath = this.resolveLocalPathForPayload(existingHd, payload.preferFilePath)
+          this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(existingHd, payload.preferFilePath))
+          return { success: true, localPath }
+        }
+      }
     }
 
     if (!payload.force) {
       const cached = this.resolvedCache.get(cacheKey)
       if (cached && existsSync(cached) && this.isImageFile(cached)) {
-        const dataUrl = this.fileToDataUrl(cached)
-        const localPath = dataUrl || this.filePathToUrl(cached)
-        this.emitCacheResolved(payload, cacheKey, localPath)
+        const localPath = this.resolveLocalPathForPayload(cached, payload.preferFilePath)
+        this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(cached, payload.preferFilePath))
         return { success: true, localPath }
       }
       if (cached && !this.isImageFile(cached)) {
@@ -184,11 +226,47 @@ export class ImageDecryptService {
     }
   }
 
+  async preloadImageHardlinkMd5s(md5List: string[]): Promise<void> {
+    const normalizedList = Array.from(
+      new Set((md5List || []).map((item) => String(item || '').trim().toLowerCase()).filter(Boolean))
+    )
+    if (normalizedList.length === 0) return
+
+    const wxid = this.configService.get('myWxid')
+    const dbPath = this.configService.get('dbPath')
+    if (!wxid || !dbPath) return
+
+    const accountDir = this.resolveAccountDir(dbPath, wxid)
+    if (!accountDir) return
+
+    try {
+      const ready = await this.ensureWcdbReady()
+      if (!ready) return
+      const requests = normalizedList.map((md5) => ({ md5, accountDir }))
+      const result = await wcdbService.resolveImageHardlinkBatch(requests)
+      if (!result.success || !Array.isArray(result.rows)) return
+
+      for (const row of result.rows) {
+        const md5 = String(row?.md5 || '').trim().toLowerCase()
+        if (!md5) continue
+        const fullPath = String(row?.data?.full_path || '').trim()
+        if (!fullPath || !existsSync(fullPath)) continue
+        this.cacheDatPath(accountDir, md5, fullPath)
+        const fileName = String(row?.data?.file_name || '').trim().toLowerCase()
+        if (fileName) {
+          this.cacheDatPath(accountDir, fileName, fullPath)
+        }
+      }
+    } catch {
+      // ignore preload failures
+    }
+  }
+
   private async decryptImageInternal(
-    payload: { sessionId?: string; imageMd5?: string; imageDatName?: string; force?: boolean },
+    payload: DecryptImagePayload,
     cacheKey: string
   ): Promise<DecryptResult> {
-    this.logInfo('开始解密图片', { md5: payload.imageMd5, datName: payload.imageDatName, force: payload.force })
+    this.logInfo('开始解密图片', { md5: payload.imageMd5, datName: payload.imageDatName, force: payload.force, hardlinkOnly: payload.hardlinkOnly === true })
     try {
       const wxid = this.configService.get('myWxid')
       const dbPath = this.configService.get('dbPath')
@@ -208,7 +286,11 @@ export class ImageDecryptService {
         payload.imageMd5,
         payload.imageDatName,
         payload.sessionId,
-        { allowThumbnail: !payload.force, skipResolvedCache: Boolean(payload.force) }
+        {
+          allowThumbnail: !payload.force,
+          skipResolvedCache: Boolean(payload.force),
+          hardlinkOnly: payload.hardlinkOnly === true
+        }
       )
 
       // 如果要求高清图但没找到，直接返回提示
@@ -225,26 +307,26 @@ export class ImageDecryptService {
 
       if (!extname(datPath).toLowerCase().includes('dat')) {
         this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, datPath)
-        const dataUrl = this.fileToDataUrl(datPath)
-        const localPath = dataUrl || this.filePathToUrl(datPath)
+        const localPath = this.resolveLocalPathForPayload(datPath, payload.preferFilePath)
         const isThumb = this.isThumbnailPath(datPath)
-        this.emitCacheResolved(payload, cacheKey, localPath)
+        this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(datPath, payload.preferFilePath))
         return { success: true, localPath, isThumb }
       }
 
-      // 查找已缓存的解密文件
-      const existing = this.findCachedOutput(cacheKey, payload.force, payload.sessionId)
-      if (existing) {
-        this.logInfo('找到已解密文件', { existing, isHd: this.isHdPath(existing) })
-        const isHd = this.isHdPath(existing)
-        // 如果要求高清但找到的是缩略图，继续解密高清图
-        if (!(payload.force && !isHd)) {
-          this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, existing)
-          const dataUrl = this.fileToDataUrl(existing)
-          const localPath = dataUrl || this.filePathToUrl(existing)
-          const isThumb = this.isThumbnailPath(existing)
-          this.emitCacheResolved(payload, cacheKey, localPath)
-          return { success: true, localPath, isThumb }
+      // 查找已缓存的解密文件（hardlink-only 模式下跳过全缓存目录扫描）
+      if (!payload.hardlinkOnly) {
+        const existing = this.findCachedOutput(cacheKey, payload.force, payload.sessionId)
+        if (existing) {
+          this.logInfo('找到已解密文件', { existing, isHd: this.isHdPath(existing) })
+          const isHd = this.isHdPath(existing)
+          // 如果要求高清但找到的是缩略图，继续解密高清图
+          if (!(payload.force && !isHd)) {
+            this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, existing)
+            const localPath = this.resolveLocalPathForPayload(existing, payload.preferFilePath)
+            const isThumb = this.isThumbnailPath(existing)
+            this.emitCacheResolved(payload, cacheKey, this.resolveEmitPath(existing, payload.preferFilePath))
+            return { success: true, localPath, isThumb }
+          }
         }
       }
 
@@ -303,9 +385,11 @@ export class ImageDecryptService {
       if (!isThumb) {
         this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
       }
-      const dataUrl = this.bufferToDataUrl(decrypted, finalExt)
-      const localPath = dataUrl || this.filePathToUrl(outputPath)
-      this.emitCacheResolved(payload, cacheKey, localPath)
+      const localPath = payload.preferFilePath
+        ? outputPath
+        : (this.bufferToDataUrl(decrypted, finalExt) || this.filePathToUrl(outputPath))
+      const emitPath = this.resolveEmitPath(outputPath, payload.preferFilePath)
+      this.emitCacheResolved(payload, cacheKey, emitPath)
       return { success: true, localPath, isThumb }
     } catch (e) {
       this.logError('解密失败', e, { md5: payload.imageMd5, datName: payload.imageDatName })
@@ -400,15 +484,17 @@ export class ImageDecryptService {
     imageMd5?: string,
     imageDatName?: string,
     sessionId?: string,
-    options?: { allowThumbnail?: boolean; skipResolvedCache?: boolean }
+    options?: { allowThumbnail?: boolean; skipResolvedCache?: boolean; hardlinkOnly?: boolean }
   ): Promise<string | null> {
     const allowThumbnail = options?.allowThumbnail ?? true
     const skipResolvedCache = options?.skipResolvedCache ?? false
+    const hardlinkOnly = options?.hardlinkOnly ?? false
     this.logInfo('[ImageDecrypt] resolveDatPath', {
       imageMd5,
       imageDatName,
       allowThumbnail,
-      skipResolvedCache
+      skipResolvedCache,
+      hardlinkOnly
     })
 
     if (!skipResolvedCache) {
@@ -433,7 +519,7 @@ export class ImageDecryptService {
     }
 
     // 1. 通过 MD5 快速定位 (MsgAttach 目录)
-    if (imageMd5) {
+    if (!hardlinkOnly && allowThumbnail && imageMd5) {
       const res = await this.fastProbabilisticSearch(join(accountDir, 'msg', 'attach'), imageMd5, allowThumbnail)
       if (res) return res
       if (imageDatName && imageDatName !== imageMd5 && this.looksLikeMd5(imageDatName)) {
@@ -443,7 +529,7 @@ export class ImageDecryptService {
     }
 
     // 2. 如果 imageDatName 看起来像 MD5，也尝试快速定位
-    if (!imageMd5 && imageDatName && this.looksLikeMd5(imageDatName)) {
+    if (!hardlinkOnly && allowThumbnail && !imageMd5 && imageDatName && this.looksLikeMd5(imageDatName)) {
       const res = await this.fastProbabilisticSearch(join(accountDir, 'msg', 'attach'), imageDatName, allowThumbnail)
       if (res) return res
     }
@@ -469,8 +555,7 @@ export class ImageDecryptService {
           if (imageDatName) this.cacheDatPath(accountDir, imageDatName, hdPath)
           return hdPath
         }
-        // 没找到高清图，返回 null（不进行全局搜索）
-        return null
+        // 没找到高清图，不要在这里直接判死；继续走后面的限定 fallback 搜索。
       }
       this.logInfo('[ImageDecrypt] hardlink miss (md5)', { imageMd5 })
       if (imageDatName && this.looksLikeMd5(imageDatName) && imageDatName !== imageMd5) {
@@ -492,7 +577,7 @@ export class ImageDecryptService {
             if (imageMd5) this.cacheDatPath(accountDir, imageMd5, hdPath)
             return hdPath
           }
-          return null
+          // 不要在这里直接返回，继续走后面的限定 fallback 搜索。
         }
         this.logInfo('[ImageDecrypt] hardlink miss (datName)', { imageDatName })
       }
@@ -515,13 +600,13 @@ export class ImageDecryptService {
           this.cacheDatPath(accountDir, imageDatName, hdPath)
           return hdPath
         }
-        return null
+        // 不要在这里直接返回，继续走后面的限定 fallback 搜索。
       }
       this.logInfo('[ImageDecrypt] hardlink miss (datName)', { imageDatName })
     }
 
-    // 高清图优先模式下，也继续尝试按 datName 搜索，避免 hardlink 缺失时过早放弃。
-    // 这里先走已有的 searchDatFile 限定搜索，不做无限制全盘暴力扫描。
+    // 高清图优先模式下，也继续尝试按 datName / md5 搜索，避免 hardlink 缺失时过早放弃。
+    // 这里先走已有的限定搜索，不做无限制全盘暴力扫描。
     if (!imageDatName && !imageMd5) return null
 
     const fallbackKey = imageDatName || imageMd5
@@ -696,7 +781,7 @@ export class ImageDecryptService {
         return null
       }
 
-      const lowerFileName = fileName.toLowerCase()
+      const lowerFileName = String(fileName).toLowerCase()
       if (lowerFileName.endsWith('.dat')) {
         const baseLower = lowerFileName.slice(0, -4)
         if (!this.isLikelyImageDatBase(baseLower) && !this.looksLikeMd5(baseLower)) {
@@ -705,13 +790,11 @@ export class ImageDecryptService {
         }
       }
 
-      // dir1 和 dir2 是 rowid，需要从 dir2id 表查询对应的目录名
       let dir1Name: string | null = null
       let dir2Name: string | null = null
 
       if (state.dirTable) {
         try {
-          // 通过 rowid 查询目录名
           const dir1Result = await wcdbService.execQuery(
             'media',
             hardlinkPath,
@@ -741,7 +824,6 @@ export class ImageDecryptService {
         return null
       }
 
-      // 构建路径: msg/attach/{dir1Name}/{dir2Name}/Img/{fileName}
       const possiblePaths = [
         join(accountDir, 'msg', 'attach', dir1Name, dir2Name, 'Img', fileName),
         join(accountDir, 'msg', 'attach', dir1Name, dir2Name, 'mg', fileName),
@@ -1576,6 +1658,16 @@ export class ImageDecryptService {
     return `data:${mimeType};base64,${buffer.toString('base64')}`
   }
 
+  private resolveLocalPathForPayload(filePath: string, preferFilePath?: boolean): string {
+    if (preferFilePath) return filePath
+    return this.resolveEmitPath(filePath, false)
+  }
+
+  private resolveEmitPath(filePath: string, preferFilePath?: boolean): string {
+    if (preferFilePath) return this.filePathToUrl(filePath)
+    return this.fileToDataUrl(filePath) || this.filePathToUrl(filePath)
+  }
+
   private fileToDataUrl(filePath: string): string | null {
     try {
       const ext = extname(filePath).toLowerCase()
@@ -1967,7 +2059,6 @@ export class ImageDecryptService {
 
   async clearCache(): Promise<{ success: boolean; error?: string }> {
     this.resolvedCache.clear()
-    this.hardlinkCache.clear()
     this.pending.clear()
     this.updateFlags.clear()
     this.cacheIndexed = false
